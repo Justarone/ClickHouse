@@ -296,6 +296,11 @@ MergeTreeData::MergeTreeData(
     /// If not choose any
     if (version_file.first.empty())
         version_file = {fs::path(relative_data_path) / MergeTreeData::FORMAT_VERSION_FILE_NAME, getStoragePolicy()->getAnyDisk()};
+    if (storage_settings.get()->use_parts_chainer) {
+        parts_chainer = MergeTreeDataChainerPtr(new MergeTreeDataChainer(getStoragePolicy()->getVolume(0)->getDisk(0),
+            relative_data_path, &Poco::Logger::get("parts_chainer")));
+        parts_chainer->setForceUpdates(storage_settings.get()->chainer_force_updates_enabled);
+    }
 
     bool version_file_exists = version_file.second->exists(version_file.first);
 
@@ -2305,6 +2310,12 @@ void MergeTreeData::checkAlterIsPossible(const AlterCommands & commands, Context
 
             if (setting_name == "storage_policy")
                 checkStoragePolicy(getContext()->getStoragePolicy(new_value.safeGet<String>()));
+            else if (setting_name == "chainer_force_updates_enabled" && parts_chainer) {
+                UInt64 force_updates;
+                if (new_value.tryGet(force_updates))
+                    parts_chainer->setForceUpdates(static_cast<bool>(force_updates));
+            }
+
         }
 
         /// Check if it is safe to reset the settings
@@ -2551,6 +2562,139 @@ MergeTreeData::PartsTemporaryRename::~PartsTemporaryRename()
     }
 }
 
+MergeTreeData::MergeTreeDataChainer::CommitFinisher::CommitFinisher(MergeTreeDataChainer & chainer_) : chainer(chainer_) {}
+
+// thread-unsafe impl (but called via parts lock)
+void MergeTreeData::MergeTreeDataChainer::CommitFinisher::finish(const DataPartsLock & lock) {
+    if (!finished)
+        chainer.commitChain(lock);
+    finished = true;
+}
+
+MergeTreeData::MergeTreeDataChainer::State::State(DiskPtr disk_, String && storage_path)
+    : disk(disk_)
+    , pending_path(fs::path(std::move(storage_path)) / PENDING_CHECKSUM_FILENAME)
+    , commited_path(fs::path(storage_path) / COMMITED_CHECKSUM_FILENAME)
+{
+    if (disk->exists(commited_path)) {
+        auto commited_buffer = disk->readFile(commited_path);
+        readIntBinary(commited_cached, *commited_buffer);
+    } else {
+        writeCommited(0);
+    }
+    if (disk->exists(pending_path)) {
+        auto pending_buffer = disk->readFile(pending_path);
+        readIntBinary(pending_cached, *pending_buffer);
+    } else {
+        writePending(0);
+    }
+}
+
+MergeTreeData::MergeTreeDataChainer::CommitFinisher::~CommitFinisher() noexcept(false) {
+    if (!finished)
+        throw Exception("Parts chain was precommited, but wasn't commited (can't commit without parts lock)", ErrorCodes::LOGICAL_ERROR);
+}
+
+void MergeTreeData::MergeTreeDataChainer::State::writePending(const MergeTreeData::MergeTreeDataChainer::Checksum & checksum) {
+    auto pending_buffer = disk->writeFile(pending_path);
+    writeIntBinary(checksum, *pending_buffer);
+    pending_buffer->sync();
+    pending_cached = checksum;
+}
+
+void MergeTreeData::MergeTreeDataChainer::State::writeCommited(const MergeTreeData::MergeTreeDataChainer::Checksum & checksum) {
+    auto commited_buffer = disk->writeFile(commited_path);
+    writeIntBinary(checksum, *commited_buffer);
+    commited_buffer->sync();
+    commited_cached = checksum;
+}
+
+MergeTreeData::MergeTreeDataChainer::Checksum MergeTreeData::MergeTreeDataChainer::State::readPending() {
+    return pending_cached;
+}
+
+MergeTreeData::MergeTreeDataChainer::Checksum MergeTreeData::MergeTreeDataChainer::State::readCommited() {
+    return commited_cached;
+}
+
+MergeTreeData::MergeTreeDataChainer::MergeTreeDataChainer(DiskPtr disk, String relative_storage_path, Poco::Logger * log_)
+    : state(disk, std::move(relative_storage_path)) 
+    , log(log_)
+{
+}
+
+CheckResult MergeTreeData::MergeTreeDataChainer::checkConsistency(const DataParts & data_parts, const DataPartsLock & /*lock*/) {
+    if (data_parts.size() == 0) {
+        const auto pending = state.readPending(), commited = state.readCommited();
+        return pending == 0 && commited == 0
+            ? CheckResult("parts_chain", true, "")
+            : CheckResult("parts_chain", false, "empty dir, but not empty checksums: " + std::to_string(pending) + " and " + std::to_string(commited));
+    }
+    const auto checksum = calculateChain(data_parts);
+    if (checksum == state.readCommited())
+        return CheckResult("parts chain", true, "");
+    else if (checksum == state.readPending()) {
+        if (log)
+            log->warning("parts chain is verified with pending value, rewriting commited");
+        state.writeCommited(checksum);
+        return CheckResult("parts chain", true, "");
+    }
+    return CheckResult("parts chain", false, "Parts chain result mismatch (checksum: " + std::to_string(checksum) + ")");
+}
+
+MergeTreeData::MergeTreeDataChainer::Checksum MergeTreeData::MergeTreeDataChainer::calculateChain(const DataParts & data_parts) {
+    SipHash hash;
+    for (const auto& part : data_parts)
+        updateFromOnePart(hash, *part);
+    return hash.get64();
+}
+
+void MergeTreeData::MergeTreeDataChainer::updateFromOnePart(SipHash & hash, const DataPart & data_part) {
+    for (const auto& [file, checksum] : data_part.checksums.files) {
+        hash.update(file);
+        hash.update(checksum);
+    }
+}
+
+MergeTreeData::MergeTreeDataChainer::CommitFinisherPtr MergeTreeData::MergeTreeDataChainer::precommitChain(DataParts & data_parts,
+    const DataPartPtr & part_to_add, const DataPartsVector & parts_to_remove, const DataPartsLock & lock) {
+    if (!checkConsistency(data_parts, lock).success) {
+        if (log)
+            log->error("Parts chain is inconsistent (force update: " + std::to_string(force_updates) + ")");
+        if (!force_updates)
+            return nullptr;
+    }
+    transformToFutureState(data_parts, part_to_add, parts_to_remove);
+    return precommitChain(data_parts, lock);
+}
+
+MergeTreeData::MergeTreeDataChainer::CommitFinisherPtr MergeTreeData::MergeTreeDataChainer::precommitChain(const DataParts & data_parts, const DataPartsLock & /*lock*/) {
+    const auto checksum = calculateChain(data_parts);
+    state.writePending(checksum);
+    return CommitFinisherPtr(new CommitFinisher(*this));
+}
+
+void MergeTreeData::MergeTreeDataChainer::transformToFutureState(DataParts & data_parts,
+    const DataPartPtr & part_to_add, const DataPartsVector & parts_to_remove) {
+    data_parts.insert(part_to_add);
+    for (const auto& part : parts_to_remove)
+        data_parts.erase(part);
+}
+
+void MergeTreeData::MergeTreeDataChainer::commitChain(const DataPartsLock & /*lock*/) {
+    const auto pending = state.readPending();
+    state.writeCommited(pending);
+}
+
+CheckResult MergeTreeData::checkPartsChain() {
+    if (!parts_chainer)
+        return CheckResult("parts chain", true, "Parts chainer is disabled");
+    auto lock = lockParts();
+    DataParts active_parts;
+    auto range = getDataPartsStateRange(DataPartState::Active);
+    active_parts.insert(range.begin(), range.end());
+    return parts_chainer->checkConsistency(active_parts, lock);
+}
 
 MergeTreeData::DataPartsVector MergeTreeData::getActivePartsToReplace(
     const MergeTreePartInfo & new_part_info,
@@ -2732,7 +2876,20 @@ bool MergeTreeData::renameTempPartAndReplace(
     part->info = part_info;
     part->is_temp = false;
     part->setState(DataPartState::PreActive);
-    part->renameTo(part_name, true);
+
+    if (parts_chainer) {
+        DataParts active_parts;
+        auto range = getDataPartsStateRange(DataPartState::Active);
+        active_parts.insert(range.begin(), range.end());
+        auto chain_finisher = parts_chainer->precommitChain(active_parts, part, covered_parts, lock);
+
+        part->renameTo(part_name, true);
+
+        if (chain_finisher)
+            chain_finisher->finish(lock);
+    } else {
+        part->renameTo(part_name, true);
+    }
 
     auto part_it = data_parts_indexes.insert(part).first;
     /// FIXME Transactions: it's not the best place for checking and setting removal_tid,

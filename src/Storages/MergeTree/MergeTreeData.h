@@ -355,6 +355,60 @@ public:
         String getModeName() const;
     };
 
+    class MergeTreeDataChainer
+    {
+        using Checksum = UInt64;
+
+    public:
+        class CommitFinisher : boost::noncopyable {
+        public:
+            CommitFinisher(MergeTreeDataChainer & chainer);
+            void finish(const DataPartsLock & lock);
+            ~CommitFinisher() noexcept(false);
+        private:
+            MergeTreeDataChainer & chainer;
+            bool finished = false;
+        };
+        using CommitFinisherPtr = std::unique_ptr<CommitFinisher>;
+
+        class State {
+            static constexpr auto PENDING_CHECKSUM_FILENAME = "pending_pending_chain.bin";
+            static constexpr auto COMMITED_CHECKSUM_FILENAME = "commited_parts_chain.bin";
+        public:
+            State(DiskPtr disk_, String && storage_path);
+            void writePending(const Checksum & checksum);
+            void writeCommited(const Checksum & checksum);
+            Checksum readPending();
+            Checksum readCommited();
+        private:
+            DiskPtr disk;
+            String pending_path;
+            String commited_path;
+            Checksum pending_cached = 0;
+            Checksum commited_cached = 0;
+        };
+
+        MergeTreeDataChainer(DiskPtr disk, String relative_storage_path, Poco::Logger * log = nullptr);
+        CommitFinisherPtr precommitChain(DataParts & data_parts, const DataPartPtr & part_to_add,
+            const DataPartsVector & parts_to_remove, const DataPartsLock & lock);
+        CheckResult checkConsistency(const DataParts & data_parts, const DataPartsLock & /*lock*/);
+        void setForceUpdates(const bool new_value) { force_updates = new_value; }
+
+    private:
+        Checksum calculateChain(const DataParts & data_parts);
+        void commitChain(const DataPartsLock & /*lock*/);
+        static void transformToFutureState(DataParts & data_parts, const DataPartPtr & part_to_add,
+            const DataPartsVector & parts_to_remove);
+        CommitFinisherPtr precommitChain(const DataParts & data_parts, const DataPartsLock & /*lock*/);
+        void updateFromOnePart(SipHash & hash, const DataPart & data_parts);
+
+        State state;
+        Poco::Logger * log;
+        bool force_updates = false;
+    };
+
+    using MergeTreeDataChainerPtr = std::unique_ptr<MergeTreeDataChainer>;
+
     /// Attach the table corresponding to the directory in full_path inside policy (must end with /), with the given columns.
     /// Correctness of names and paths is not checked.
     ///
@@ -449,6 +503,7 @@ public:
 
     Int64 getMaxBlockNumber() const;
 
+    CheckResult checkPartsChain();
 
     /// Returns a copy of the list so that the caller shouldn't worry about locks.
     DataParts getDataParts(const DataPartStates & affordable_states) const;
@@ -1052,6 +1107,8 @@ protected:
     ColumnsDescription object_columns;
 
     MergeTreePartsMover parts_mover;
+
+    MergeTreeDataChainerPtr parts_chainer;
 
     /// Executors are common for both ReplicatedMergeTree and plain MergeTree
     /// but they are being started and finished in derived classes, so let them be protected.
