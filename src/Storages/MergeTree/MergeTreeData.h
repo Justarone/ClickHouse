@@ -358,6 +358,7 @@ public:
     class MergeTreeDataChainer
     {
         using Checksum = UInt64;
+        using Checksums = std::vector<Checksum>;
 
     public:
         class CommitFinisher : boost::noncopyable {
@@ -372,20 +373,20 @@ public:
         using CommitFinisherPtr = std::unique_ptr<CommitFinisher>;
 
         class State {
-            static constexpr auto PENDING_CHECKSUM_FILENAME = "pending_pending_chain.bin";
+            static constexpr auto PENDING_CHECKSUM_FILENAME = "pending_parts_chain.bin";
             static constexpr auto COMMITED_CHECKSUM_FILENAME = "commited_parts_chain.bin";
         public:
             State(DiskPtr disk_, String && storage_path);
-            void writePending(const Checksum & checksum);
-            void writeCommited(const Checksum & checksum);
-            Checksum readPending();
-            Checksum readCommited();
+            void writePending(const Checksums & checksums);
+            void writeCommited(const Checksums & checksums);
+            Checksums readPending();
+            Checksums readCommited();
         private:
             DiskPtr disk;
             String pending_path;
             String commited_path;
-            Checksum pending_cached = 0;
-            Checksum commited_cached = 0;
+            Checksums pending_cached = {};
+            Checksums commited_cached = {};
         };
 
         MergeTreeDataChainer(DiskPtr disk, String relative_storage_path, Poco::Logger * log = nullptr);
@@ -395,7 +396,8 @@ public:
         void setForceUpdates(const bool new_value) { force_updates = new_value; }
 
     private:
-        Checksum calculateChain(const DataParts & data_parts);
+        Checksums calculateChain(const DataParts & data_parts);
+        std::optional<String> compareChains(const Checksums & checksums, const Checksums & written, const DataParts & data_parts);
         void commitChain(const DataPartsLock & /*lock*/);
         static void transformToFutureState(DataParts & data_parts, const DataPartPtr & part_to_add,
             const DataPartsVector & parts_to_remove);
