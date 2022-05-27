@@ -322,7 +322,7 @@ public:
 
     MinMaxIndexPtr minmax_idx;
 
-    Checksums checksums;
+    mutable Checksums checksums;
 
     /// Columns with values, that all have been zeroed by expired ttl
     NameSet expired_columns;
@@ -472,6 +472,8 @@ public:
     /// Check metadata in cache is consistent with actual metadata on disk(if use_metadata_cache is true)
     std::unordered_map<String, uint128> checkMetadata() const;
 
+    /// If checksums.txt exists, reads file's checksums (and sizes) from it
+    void loadChecksums(bool require) const;
 
 protected:
 
@@ -487,7 +489,7 @@ protected:
 
     /// Total size on disk, not only columns. May not contain size of
     /// checksums.txt and columns.txt. 0 - if not counted;
-    UInt64 bytes_on_disk{0};
+    mutable UInt64 bytes_on_disk{0};
 
     /// Columns description. Cannot be changed, after part initialization.
     NamesAndTypesList columns;
@@ -519,7 +521,6 @@ protected:
 
     void initializePartMetadataManager();
 
-
 private:
     /// In compact parts order of columns is necessary
     NameToNumber column_name_to_position;
@@ -536,9 +537,6 @@ private:
     void loadColumns(bool require);
 
     static void appendFilesOfColumns(Strings & files);
-
-    /// If checksums.txt exists, reads file's checksums (and sizes) from it
-    void loadChecksums(bool require);
 
     static void appendFilesOfChecksums(Strings & files);
 

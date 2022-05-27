@@ -2562,15 +2562,6 @@ MergeTreeData::PartsTemporaryRename::~PartsTemporaryRename()
     }
 }
 
-MergeTreeData::MergeTreeDataChainer::CommitFinisher::CommitFinisher(MergeTreeDataChainer & chainer_) : chainer(chainer_) {}
-
-// thread-unsafe impl (but called via parts lock)
-void MergeTreeData::MergeTreeDataChainer::CommitFinisher::finish(const DataPartsLock & lock) {
-    if (!finished)
-        chainer.commitChain(lock);
-    finished = true;
-}
-
 MergeTreeData::MergeTreeDataChainer::State::State(DiskPtr disk_, String && storage_path)
     : disk(disk_)
     , pending_path(fs::path(storage_path) / PENDING_CHECKSUM_FILENAME)
@@ -2597,11 +2588,6 @@ MergeTreeData::MergeTreeDataChainer::State::State(DiskPtr disk_, String && stora
     } else {
         writePending({});
     }
-}
-
-MergeTreeData::MergeTreeDataChainer::CommitFinisher::~CommitFinisher() noexcept(false) {
-    if (!finished)
-        throw Exception("Parts chain was precommited, but wasn't commited (can't commit without parts lock)", ErrorCodes::LOGICAL_ERROR);
 }
 
 void MergeTreeData::MergeTreeDataChainer::State::writePending(const MergeTreeData::MergeTreeDataChainer::Checksums & checksums) {
@@ -2701,22 +2687,22 @@ void MergeTreeData::MergeTreeDataChainer::updateFromOnePart(SipHash & hash, cons
     }
 }
 
-MergeTreeData::MergeTreeDataChainer::CommitFinisherPtr MergeTreeData::MergeTreeDataChainer::precommitChain(DataParts & data_parts,
+bool MergeTreeData::MergeTreeDataChainer::precommitChain(DataParts & data_parts,
     const DataPartPtr & part_to_add, const DataPartsVector & parts_to_remove, const DataPartsLock & lock) {
     if (!checkConsistency(data_parts, lock).success) {
         if (log)
             log->error("Parts chain is inconsistent (force update: " + std::to_string(force_updates) + ")");
         if (!force_updates)
-            return nullptr;
+            return false;
     }
     transformToFutureState(data_parts, part_to_add, parts_to_remove);
-    return precommitChain(data_parts, lock);
+    precommitChain(data_parts, lock);
+    return true;
 }
 
-MergeTreeData::MergeTreeDataChainer::CommitFinisherPtr MergeTreeData::MergeTreeDataChainer::precommitChain(const DataParts & data_parts, const DataPartsLock & /*lock*/) {
+void MergeTreeData::MergeTreeDataChainer::precommitChain(const DataParts & data_parts, const DataPartsLock & /*lock*/) {
     const auto checksum = calculateChain(data_parts);
     state.writePending({checksum});
-    return CommitFinisherPtr(new CommitFinisher(*this));
 }
 
 void MergeTreeData::MergeTreeDataChainer::transformToFutureState(DataParts & data_parts,
@@ -2926,12 +2912,12 @@ bool MergeTreeData::renameTempPartAndReplace(
         DataParts active_parts;
         auto range = getDataPartsStateRange(DataPartState::Active);
         active_parts.insert(range.begin(), range.end());
-        auto chain_finisher = parts_chainer->precommitChain(active_parts, part, covered_parts, lock);
+        auto need_to_commit = parts_chainer->precommitChain(active_parts, part, covered_parts, lock);
 
         part->renameTo(part_name, true);
 
-        if (chain_finisher)
-            chain_finisher->finish(lock);
+        if (need_to_commit)
+            parts_chainer->commitChain(lock);
     } else {
         part->renameTo(part_name, true);
     }

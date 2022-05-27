@@ -1772,6 +1772,7 @@ CheckResults StorageMergeTree::checkData(const ASTPtr & query, ContextPtr local_
         {
             try
             {
+                part->loadChecksums(true);
                 checkDataPart(part, true);
                 part->checkMetadata();
                 results.emplace_back(part->name, true, "");
