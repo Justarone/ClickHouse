@@ -358,7 +358,6 @@ public:
     class MergeTreeDataChainer
     {
         using Checksum = UInt64;
-        using Checksums = std::vector<Checksum>;
 
     public:
         class State {
@@ -366,30 +365,30 @@ public:
             static constexpr auto COMMITED_CHECKSUM_FILENAME = "commited_parts_chain.bin";
         public:
             State(DiskPtr disk_, String && storage_path);
-            void writePending(const Checksums & checksums);
-            void writeCommited(const Checksums & checksums);
-            Checksums readPending();
-            Checksums readCommited();
+            void writePending(const Checksum & checksum);
+            void writeCommited(const Checksum & checksum);
+            Checksum readPending();
+            Checksum readCommited();
         private:
-            void writeFileAndSync(const Checksums & checksums, const String & filepath);
+            void writeFileAndSync(const Checksum & checksum, const String & filepath);
 
             DiskPtr disk;
             String pending_path;
             String commited_path;
-            Checksums pending_cached = {};
-            Checksums commited_cached = {};
+            Checksum pending_cached = {};
+            Checksum commited_cached = {};
         };
 
         MergeTreeDataChainer(DiskPtr disk, String relative_storage_path, Poco::Logger * log = nullptr);
         bool precommitChain(DataParts & data_parts, const DataPartPtr & part_to_add,
             const DataPartsVector & parts_to_remove, const DataPartsLock & lock);
         CheckResult checkConsistency(const DataParts & data_parts, const DataPartsLock & /*lock*/);
-        void setForceUpdates(const bool new_value) { force_updates = new_value; }
+        void setIgnoreOnInconsistency(const bool new_value) { ignore_on_inconsistency = new_value; }
+        void setThrowOnInconsistency(const bool new_value) { throw_on_inconsistency = new_value; }
         void commitChain(const DataPartsLock & /*lock*/);
 
     private:
-        Checksums calculateChain(const DataParts & data_parts);
-        std::optional<String> compareChains(const Checksums & checksums, const Checksums & written, const DataParts & data_parts);
+        Checksum calculateChain(const DataParts & data_parts);
         static void transformToFutureState(DataParts & data_parts, const DataPartPtr & part_to_add,
             const DataPartsVector & parts_to_remove);
         void precommitChain(const DataParts & data_parts, const DataPartsLock & /*lock*/);
@@ -397,7 +396,8 @@ public:
 
         State state;
         Poco::Logger * log;
-        bool force_updates = false;
+        bool throw_on_inconsistency = false;
+        bool ignore_on_inconsistency = false;
     };
 
     using MergeTreeDataChainerPtr = std::unique_ptr<MergeTreeDataChainer>;

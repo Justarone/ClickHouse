@@ -142,7 +142,8 @@ struct Settings;
     M(UInt64, part_moves_between_shards_delay_seconds, 30, "Time to wait before/after moving parts between shards.", 0) \
     M(Bool, use_metadata_cache, false, "Experimental feature to speed up parts loading process by using MergeTree metadata cache", 0) \
     M(Bool, use_parts_chainer, false, "Building a chain of parts and add capability to validate it", 0) \
-    M(Bool, chainer_force_updates_enabled, false, "Chainer will ignore inconsistency before updates", 0) \
+    M(Bool, parts_chainer_throw_on_inconsistency, false, "Chainer will throw on inconsistency before updates", 0) \
+    M(Bool, parts_chainer_ignore_on_inconsistency, false, "Chainer will ignore inconsistency before updates", 0) \
     \
     /** Obsolete settings. Kept for backward compatibility only. */ \
     M(UInt64, min_relative_delay_to_yield_leadership, 120, "Obsolete setting, does nothing.", 0) \
