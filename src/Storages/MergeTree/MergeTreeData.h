@@ -371,6 +371,8 @@ public:
             Checksums readPending();
             Checksums readCommited();
         private:
+            void writeFileAndSync(const Checksums & checksums, const String & filepath);
+
             DiskPtr disk;
             String pending_path;
             String commited_path;

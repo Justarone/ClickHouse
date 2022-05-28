@@ -2567,44 +2567,41 @@ MergeTreeData::MergeTreeDataChainer::State::State(DiskPtr disk_, String && stora
     , pending_path(fs::path(storage_path) / PENDING_CHECKSUM_FILENAME)
     , commited_path(fs::path(std::move(storage_path)) / COMMITED_CHECKSUM_FILENAME)
 {
-    if (disk->exists(commited_path)) {
-        auto commited_buffer = disk->readFile(commited_path);
-        std::size_t commited_count = 0;
-        readIntBinary(commited_count, *commited_buffer);
-        commited_cached.resize(commited_count);
-        for (auto& checksum : commited_cached)
-            readIntBinary(checksum, *commited_buffer);
-    } else {
-        writeCommited({});
-    }
+#define INIT_VALUE(VALUE_TYPE, WRITE_FUNC) \
+    do { \
+        if (disk->exists(VALUE_TYPE##_path)) { \
+            auto buffer = disk->readFile(VALUE_TYPE##_path); \
+            std::size_t count = 0; \
+            readIntBinary(count, *buffer); \
+            VALUE_TYPE##_cached.resize(count); \
+            for (auto& checksum : VALUE_TYPE##_cached) \
+                readIntBinary(checksum, *buffer); \
+        } else { \
+            WRITE_FUNC({}); \
+        } \
+    } while(0)
 
-    if (disk->exists(pending_path)) {
-        auto pending_buffer = disk->readFile(pending_path);
-        std::size_t pending_count = 0;
-        readIntBinary(pending_count, *pending_buffer);
-        pending_cached.resize(pending_count);
-        for (auto& checksum : pending_cached)
-            readIntBinary(checksum, *pending_buffer);
-    } else {
-        writePending({});
-    }
+    INIT_VALUE(commited, writeCommited);
+    INIT_VALUE(pending, writePending);
+
+#undef INIT_VALUE
+}
+
+void MergeTreeData::MergeTreeDataChainer::State::writeFileAndSync(const MergeTreeData::MergeTreeDataChainer::Checksums & checksums, const String& filepath) {
+    auto buffer = disk->writeFile(filepath);
+    writeIntBinary(checksums.size(), *buffer);
+    for (const auto& checksum : checksums)
+        writeIntBinary(checksum, *buffer);
+    buffer->sync();
 }
 
 void MergeTreeData::MergeTreeDataChainer::State::writePending(const MergeTreeData::MergeTreeDataChainer::Checksums & checksums) {
-    auto pending_buffer = disk->writeFile(pending_path);
-    writeIntBinary(checksums.size(), *pending_buffer);
-    for (const auto& checksum : checksums)
-        writeIntBinary(checksum, *pending_buffer);
-    pending_buffer->sync();
+    writeFileAndSync(checksums, pending_path);
     pending_cached = checksums;
 }
 
 void MergeTreeData::MergeTreeDataChainer::State::writeCommited(const MergeTreeData::MergeTreeDataChainer::Checksums & checksums) {
-    auto commited_buffer = disk->writeFile(commited_path);
-    writeIntBinary(checksums.size(), *commited_buffer);
-    for (const auto& checksum : checksums)
-        writeIntBinary(checksum, *commited_buffer);
-    commited_buffer->sync();
+    writeFileAndSync(checksums, commited_path);
     commited_cached = checksums;
 }
 
@@ -2627,7 +2624,7 @@ CheckResult MergeTreeData::MergeTreeDataChainer::checkConsistency(const DataPart
         const auto pending = state.readPending(), commited = state.readCommited();
         return pending.empty() && commited.empty()
             ? CheckResult("parts_chain", true, "")
-            : CheckResult("parts_chain", false, "empty dir, but not empty checksums, sizes: " + std::to_string(pending.size()) + " and " + std::to_string(commited.size()));
+            : CheckResult("parts_chain", false, "no parts, but not empty checksums, sizes: " + std::to_string(pending.size()) + " and " + std::to_string(commited.size()));
     }
     const auto checksums = calculateChain(data_parts);
     const auto commited = state.readCommited(); 
@@ -2648,8 +2645,14 @@ CheckResult MergeTreeData::MergeTreeDataChainer::checkConsistency(const DataPart
 
 std::optional<String> MergeTreeData::MergeTreeDataChainer::compareChains(const Checksums & checksums, const Checksums & written, const DataParts & data_parts) {
     assert(checksums.size() == data_parts.size());
-    auto data_parts_it = data_parts.begin();
-    for (std::size_t i = 0; i < std::min(checksums.size(), written.size()); data_parts_it++, i++) {
+    if (checksums.size() == 0)
+        return std::nullopt;
+
+    if (checksums[0] != written[0])
+        return { "First (" + (*data_parts.begin())->name + ") or last (" + (*--data_parts.end())->name + ") part was deleted OR part itself is not valid!" };
+
+    auto data_parts_it = ++data_parts.begin();
+    for (std::size_t i = 1; i < std::min(checksums.size(), written.size()); data_parts_it++, i++) {
         if (checksums[i] != written[i])
             return { "One or more parts before " + (*data_parts_it)->name + " were deleted OR part itself is not valid!" };
     }
@@ -2658,24 +2661,29 @@ std::optional<String> MergeTreeData::MergeTreeDataChainer::compareChains(const C
         return std::optional{ 
             checksums.size() < written.size()
                 ? "Some parts in the end of the chain were deleted"
-                : "There are suspicious parts at the end of chain (can't be validated)"};
+                : "There are suspicious parts at the end of chain (can't be validated)"}; // unlikely, because first part in chain depends on last one
 
     return std::nullopt;
 }
 
 MergeTreeData::MergeTreeDataChainer::Checksums MergeTreeData::MergeTreeDataChainer::calculateChain(const DataParts & data_parts) {
+    if (data_parts.size() == 0)
+        return {};
+
     Checksums result;
     result.reserve(data_parts.size());
 
-    SipHash prev{0, 0};
+    SipHash prevHash{0, 0};
+    updateFromOnePart(prevHash, *(*--data_parts.end()));
+    Checksum prev = prevHash.get64();
+
     for (const auto& part : data_parts) {
         SipHash hash{0, 0};
         hash.update(prev);
         updateFromOnePart(hash, *part);
 
-        const auto hash_value = hash.get64();
-        prev = hash;
-        result.push_back(hash_value);
+        prev = hash.get64();
+        result.push_back(prev);
     }
     return result;
 }
@@ -2691,7 +2699,7 @@ bool MergeTreeData::MergeTreeDataChainer::precommitChain(DataParts & data_parts,
     const DataPartPtr & part_to_add, const DataPartsVector & parts_to_remove, const DataPartsLock & lock) {
     if (!checkConsistency(data_parts, lock).success) {
         if (log)
-            log->error("Parts chain is inconsistent (force update: " + std::to_string(force_updates) + ")");
+            log->error("Parts chain is inconsistent (chain won't be updated)");
         if (!force_updates)
             return false;
     }
@@ -2701,8 +2709,7 @@ bool MergeTreeData::MergeTreeDataChainer::precommitChain(DataParts & data_parts,
 }
 
 void MergeTreeData::MergeTreeDataChainer::precommitChain(const DataParts & data_parts, const DataPartsLock & /*lock*/) {
-    const auto checksum = calculateChain(data_parts);
-    state.writePending({checksum});
+    state.writePending(calculateChain(data_parts));
 }
 
 void MergeTreeData::MergeTreeDataChainer::transformToFutureState(DataParts & data_parts,
