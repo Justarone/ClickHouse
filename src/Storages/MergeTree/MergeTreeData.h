@@ -355,6 +355,53 @@ public:
         String getModeName() const;
     };
 
+    class MergeTreeDataChainer
+    {
+        using Checksum = UInt64;
+
+    public:
+        class State {
+            static constexpr auto PENDING_CHECKSUM_FILENAME = "pending_parts_chain.bin";
+            static constexpr auto COMMITED_CHECKSUM_FILENAME = "commited_parts_chain.bin";
+        public:
+            State(DiskPtr disk_, String && storage_path);
+            void writePending(const Checksum & checksum);
+            void writeCommited(const Checksum & checksum);
+            Checksum readPending();
+            Checksum readCommited();
+        private:
+            void writeFileAndSync(const Checksum & checksum, const String & filepath);
+
+            DiskPtr disk;
+            String pending_path;
+            String commited_path;
+            Checksum pending_cached = {};
+            Checksum commited_cached = {};
+        };
+
+        MergeTreeDataChainer(DiskPtr disk, String relative_storage_path, Poco::Logger * log = nullptr);
+        bool precommitChain(DataParts & data_parts, const DataPartPtr & part_to_add,
+            const DataPartsVector & parts_to_remove, const DataPartsLock & lock);
+        CheckResult checkConsistency(const DataParts & data_parts, const DataPartsLock & /*lock*/);
+        void setIgnoreOnInconsistency(const bool new_value) { ignore_on_inconsistency = new_value; }
+        void setThrowOnInconsistency(const bool new_value) { throw_on_inconsistency = new_value; }
+        void commitChain(const DataPartsLock & /*lock*/);
+
+    private:
+        Checksum calculateChain(const DataParts & data_parts);
+        static void transformToFutureState(DataParts & data_parts, const DataPartPtr & part_to_add,
+            const DataPartsVector & parts_to_remove);
+        void precommitChain(const DataParts & data_parts, const DataPartsLock & /*lock*/);
+        void updateFromOnePart(SipHash & hash, const DataPart & data_parts);
+
+        State state;
+        Poco::Logger * log;
+        bool throw_on_inconsistency = false;
+        bool ignore_on_inconsistency = false;
+    };
+
+    using MergeTreeDataChainerPtr = std::unique_ptr<MergeTreeDataChainer>;
+
     /// Attach the table corresponding to the directory in full_path inside policy (must end with /), with the given columns.
     /// Correctness of names and paths is not checked.
     ///
@@ -449,6 +496,7 @@ public:
 
     Int64 getMaxBlockNumber() const;
 
+    CheckResult checkPartsChain();
 
     /// Returns a copy of the list so that the caller shouldn't worry about locks.
     DataParts getDataParts(const DataPartStates & affordable_states) const;
@@ -1052,6 +1100,8 @@ protected:
     ColumnsDescription object_columns;
 
     MergeTreePartsMover parts_mover;
+
+    MergeTreeDataChainerPtr parts_chainer;
 
     /// Executors are common for both ReplicatedMergeTree and plain MergeTree
     /// but they are being started and finished in derived classes, so let them be protected.

@@ -961,7 +961,7 @@ void IMergeTreeDataPart::appendFilesOfPartitionAndMinMaxIndex(Strings & files) c
             minmax_idx->appendFiles(storage, files);
 }
 
-void IMergeTreeDataPart::loadChecksums(bool require)
+void IMergeTreeDataPart::loadChecksums(bool require) const
 {
     const String path = fs::path(getFullRelativePath()) / "checksums.txt";
     bool exists = metadata_manager->exists("checksums.txt");

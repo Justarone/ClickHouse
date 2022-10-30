@@ -84,7 +84,7 @@ bool MutatePlainMergeTreeTask::executeStep()
                 new_part = mutate_task->getFuture().get();
 
                 /// FIXME Transactions: it's too optimistic, better to lock parts before starting transaction
-                storage.renameTempPartAndReplace(new_part, merge_mutate_entry->txn.get());
+                auto covered_parts = storage.renameTempPartAndReplace(new_part, merge_mutate_entry->txn.get());
                 storage.updateMutationEntriesErrors(future_part, true, "");
                 write_part_log({});
 

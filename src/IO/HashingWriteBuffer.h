@@ -4,6 +4,7 @@
 #include <IO/BufferWithOwnMemory.h>
 #include <IO/ReadHelpers.h>
 #include <city.h>
+#include <Common/SipHash.h>
 
 #define DBMS_DEFAULT_HASHING_BLOCK_SIZE 2048ULL
 
@@ -16,6 +17,7 @@ class IHashingBuffer : public BufferWithOwnMemory<Buffer>
 {
 public:
     using uint128 = CityHash_v1_0_2::uint128;
+    using uint64 = CityHash_v1_0_2::uint64;
 
     explicit IHashingBuffer(size_t block_size_ = DBMS_DEFAULT_HASHING_BLOCK_SIZE)
         : BufferWithOwnMemory<Buffer>(block_size_), block_pos(0), block_size(block_size_), state(0, 0)
@@ -25,14 +27,15 @@ public:
     uint128 getHash()
     {
         if (block_pos)
-            return CityHash_v1_0_2::CityHash128WithSeed(&BufferWithOwnMemory<Buffer>::memory[0], block_pos, state);
-        else
-            return state;
+            state.update(&BufferWithOwnMemory<Buffer>::memory[0], block_pos);
+        uint64 high, low;
+        state.get128(low, high);
+        return uint128{low, high};
     }
 
     void append(DB::BufferBase::Position data)
     {
-        state = CityHash_v1_0_2::CityHash128WithSeed(data, block_size, state);
+        state.update(data, block_size);
     }
 
     /// computation of the hash depends on the partitioning of blocks
@@ -42,7 +45,7 @@ public:
 protected:
     size_t block_pos;
     size_t block_size;
-    uint128 state;
+    SipHash state;
 };
 
 /** Computes the hash from the data to write and passes it to the specified WriteBuffer.
@@ -74,7 +77,7 @@ public:
         out.next(); /// If something has already been written to `out` before us, we will not let the remains of this data affect the hash.
         working_buffer = out.buffer();
         pos = working_buffer.begin();
-        state = uint128(0, 0);
+        state = SipHash(0, 0);
     }
 
     uint128 getHash()

@@ -1772,6 +1772,7 @@ CheckResults StorageMergeTree::checkData(const ASTPtr & query, ContextPtr local_
         {
             try
             {
+                part->loadChecksums(true);
                 checkDataPart(part, true);
                 part->checkMetadata();
                 results.emplace_back(part->name, true, "");
@@ -1782,6 +1783,8 @@ CheckResults StorageMergeTree::checkData(const ASTPtr & query, ContextPtr local_
             }
         }
     }
+    if (std::all_of(results.begin(), results.end(), [](const auto& check_result) { return check_result.success; }))
+        results.push_back(checkPartsChain());
     return results;
 }
 

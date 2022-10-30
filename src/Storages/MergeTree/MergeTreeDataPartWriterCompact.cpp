@@ -1,5 +1,6 @@
 #include <Storages/MergeTree/MergeTreeDataPartWriterCompact.h>
 #include <Storages/MergeTree/MergeTreeDataPartCompact.h>
+#include <Common/SipHash.h>
 
 namespace DB
 {
@@ -318,19 +319,20 @@ void MergeTreeDataPartWriterCompact::addToChecksums(MergeTreeDataPartChecksums &
     String marks_file_name = MergeTreeDataPartCompact::DATA_FILE_NAME +  marks_file_extension;
 
     size_t uncompressed_size = 0;
-    CityHash_v1_0_2::uint128 uncompressed_hash{0, 0};
+    SipHash uncompressed_hash(0, 0);
 
     for (const auto & [_, stream] : streams_by_codec)
     {
         uncompressed_size += stream->hashing_buf.count();
         auto stream_hash = stream->hashing_buf.getHash();
-        uncompressed_hash = CityHash_v1_0_2::CityHash128WithSeed(
-            reinterpret_cast<char *>(&stream_hash), sizeof(stream_hash), uncompressed_hash);
+        uncompressed_hash.update(reinterpret_cast<char *>(&stream_hash), sizeof(stream_hash));
     }
 
     checksums.files[data_file_name].is_compressed = true;
     checksums.files[data_file_name].uncompressed_size = uncompressed_size;
-    checksums.files[data_file_name].uncompressed_hash = uncompressed_hash;
+    CityHash_v1_0_2::uint64 high, low;
+    uncompressed_hash.get128(low, high);
+    checksums.files[data_file_name].uncompressed_hash = {high, low};
     checksums.files[data_file_name].file_size = plain_hashing.count();
     checksums.files[data_file_name].file_hash = plain_hashing.getHash();
 
